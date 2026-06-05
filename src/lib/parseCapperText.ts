@@ -1,4 +1,4 @@
-export type BetType = 'ML' | 'spread' | 'total' | 'unknown';
+export type BetType = 'ML' | 'spread' | 'total' | 'prop' | 'unknown';
 export type SpecialLabel = 'POD' | 'MAX' | 'BEST BET' | 'POTD';
 
 export interface ParsedPick {
@@ -8,6 +8,7 @@ export interface ParsedPick {
   betType: BetType;
   line?: number;
   overUnder?: 'over' | 'under';
+  propStat?: string;    // for prop bets: "points", "rebounds", etc.
   odds: number;
   units: number;
   sport?: string;
@@ -85,6 +86,20 @@ const TEAM_SPORT_LOOKUP: Record<string, string> = {
   'lg twins': 'KBO', 'kt wiz': 'KBO', 'doosan bears': 'KBO',
   'nc dinos': 'KBO', 'ssg landers': 'KBO', 'hanwha eagles': 'KBO',
   'kia tigers': 'KBO',
+  // ── NBA players ──────────────────────────────────────────────────────
+  'brunson': 'NBA', 'wembanyama': 'NBA', 'towns': 'NBA', 'anunoby': 'NBA',
+  'bridges': 'NBA', 'mitchell': 'NBA', 'curry': 'NBA', 'lebron': 'NBA',
+  'durant': 'NBA', 'giannis': 'NBA', 'embiid': 'NBA', 'jokic': 'NBA',
+  'sga': 'NBA', 'gilgeous-alexander': 'NBA', 'tatum': 'NBA', 'jaylen brown': 'NBA',
+  'lillard': 'NBA', 'booker': 'NBA', 'morant': 'NBA', 'edwards': 'NBA',
+  'hart': 'NBA', ' og anunoby': 'NBA', 'randle': 'NBA', 'barrett': 'NBA',
+  // ── NFL players ──────────────────────────────────────────────────────
+  'mahomes': 'NFL', 'jefferson': 'NFL', 'tyreek hill': 'NFL', 'chase': 'NFL',
+  'mccaffrey': 'NFL', 'derrick henry': 'NFL', 'lamb': 'NFL', 'stroud': 'NFL',
+  'burrow': 'NFL', 'lamar jackson': 'NFL', 'josh allen': 'NFL',
+  // ── MLB players ──────────────────────────────────────────────────────
+  'judge': 'MLB', 'ohtani': 'MLB', 'acuna': 'MLB', 'trout': 'MLB',
+  'betts': 'MLB', 'lindor': 'MLB', 'juan soto': 'MLB',
   // ── Tennis (known player surnames) ───────────────────────────────────
   'djokovic': 'TENNIS', 'alcaraz': 'TENNIS', 'sinner': 'TENNIS',
   'medvedev': 'TENNIS', 'zverev': 'TENNIS', 'nadal': 'TENNIS',
@@ -131,6 +146,27 @@ function stripEmoji(s: string): string {
   return s.replace(/\p{Extended_Pictographic}|️|‍/gu, '').trim();
 }
 
+// Expand short Over/Under notation before all other parsing.
+// O4.5 → over 4.5 | U7.5 → under 7.5
+// Safe: \b ensures "2U" (unit size) and "Oklahoma" never match.
+function normalizeLine(s: string): string {
+  return s
+    .replace(/\bO(\d+\.?\d*)\b/g, 'over $1')
+    .replace(/\bU(\d+\.?\d*)\b/g, 'under $1');
+}
+
+function normalizePropStat(stat: string): string {
+  const s = stat.toLowerCase().trim();
+  if (/^pts?$|^points?$/.test(s))     return 'points';
+  if (/^reb$|^rebounds?$/.test(s))    return 'rebounds';
+  if (/^ast$|^assists?$/.test(s))     return 'assists';
+  if (/^blk$|^blocks?$/.test(s))      return 'blocks';
+  if (/^stl$|^steals?$/.test(s))      return 'steals';
+  if (/^3pm?$|^threes?$/.test(s))     return 'threes';
+  if (/^pra$/.test(s))                return 'PRA';
+  return s;
+}
+
 // Returns true only if the line contains at least one unambiguous betting signal.
 // Used to gate isNoiseLine and parsePickLine — anything with zero signals cannot be a bet.
 function hasBettingSignal(s: string): boolean {
@@ -149,6 +185,10 @@ function hasBettingSignal(s: string): boolean {
   if (/\$\d+/.test(s)) return true;
   // Sport-specific bet markers
   if (/\b(F5|ATS|RL|PL)\b/.test(s)) return true;
+  // Short Over/Under notation: O4.5, U7.5, O218
+  if (/\b[OU]\d+(?:\.\d+)?\b/i.test(s)) return true;
+  // Player prop: "20+ points", "8.5 rebounds", "25 pts"
+  if (/\b\d+(?:\.\d+)?\+?\s+(points?|pts?|rebounds?|reb|assists?|ast|blocks?|blk|steals?|stl|threes?|3pm?|pra)\b/i.test(s)) return true;
   return false;
 }
 
@@ -251,6 +291,36 @@ function parsePickLine(
 
   // Hard gate: a line with zero betting signals cannot be a bet
   if (!hasBettingSignal(s)) return null;
+
+  // ── Player prop detection ──────────────────────────────────────────
+  // Matches: "Brunson 20+ points", "Tatum 25.5 pts -115 2U", "SGA 30 PRA"
+  const PROP_RE = /^(.+?)\s+(\d+(?:\.\d+)?)\+?\s+(points?|pts?|rebounds?|reb|assists?|ast|blocks?|blk|steals?|stl|threes?|3pm?|pra)\b(.*)$/i;
+  const propMatch = s.match(PROP_RE);
+  if (propMatch) {
+    const playerName = propMatch[1].replace(/[-–—]/g, ' ').replace(/[()[\]]/g, '').trim();
+    const propLine   = parseFloat(propMatch[2]);
+    const propStat   = normalizePropStat(propMatch[3]);
+    const rest       = propMatch[4].trim();
+    const { text: restAfterLabel, label: propSpecialLabel } = extractSpecialLabel(s);
+    void restAfterLabel;
+    const { text: restNoUnits, units: propUnits } = extractUnits(rest, defaultUnits);
+    const { nums: propNums } = extractNumbers(restNoUnits);
+    const { odds: propOdds } = classifyNums(propNums);
+    const resolvedSport = sport ?? detectSportFromName(playerName);
+    return {
+      capper,
+      team:        playerName,
+      betType:     'prop',
+      line:        propLine,
+      overUnder:   'over',   // prop "20+" means over 20
+      propStat,
+      odds:        propOdds,
+      units:       propUnits,
+      ...(resolvedSport ? { sport: resolvedSport } : {}),
+      specialLabel: propSpecialLabel,
+      raw,
+    };
+  }
 
   const { text: afterLabel, label: specialLabel } = extractSpecialLabel(s);
   s = afterLabel;
@@ -484,7 +554,7 @@ export function parseCapperText(input: string): ParseResult {
   let foundFirstCapper = false;
 
   for (const raw of rawLines) {
-    const line = raw.trim();
+    const line = normalizeLine(raw.trim());
     if (!line) continue;
 
     // ── Capper header detection ─────────────────────────────────────
@@ -537,15 +607,44 @@ export function parseCapperText(input: string): ParseResult {
       continue;
     }
 
-    // Detect parlay lines: "Parlay: Brewers ML + Phillies F5", "parlaying X + Y"
+    // ── Explicit parlay keyword: "Parlay: X + Y", "Parlay: X / Y / Z" ──
     if (/\bparlay(ing|ed|s)?\b/i.test(line)) {
-      const parlayText = line.replace(/^\s*parlay(ing|ed|s)?:?\s*/i, '').trim();
-      const legs = parlayText.split(/\s+\+\s+/);
+      const parlayText = line
+        .replace(/^\s*parlay(ing|ed|s)?:?\s*/i, '')  // strip leading "Parlay:"
+        .replace(/\bparlay\b/gi, '')                  // strip trailing "parlay"
+        .trim();
+      const legs = parlayText.split(/\s+[+/]\s+/);
       for (const leg of legs) {
         const pick = parsePickLine(leg.trim(), currentCapper, currentSport, tierUnits);
         if (pick) picks.push({ ...pick, isParlay: true });
       }
       continue;
+    }
+
+    // ── Implicit parlay: " + " separated legs (e.g. "Brewers ML + Phillies F5") ──
+    {
+      const plusLegs = line.split(/\s+\+\s+/);
+      if (plusLegs.length >= 2) {
+        const legPicks: ParsedPick[] = [];
+        for (const leg of plusLegs) {
+          const p = parsePickLine(leg.trim(), currentCapper, currentSport, tierUnits);
+          if (p) legPicks.push({ ...p, isParlay: true });
+        }
+        if (legPicks.length >= 2) { picks.push(...legPicks); continue; }
+      }
+    }
+
+    // ── Implicit parlay: " / " separated legs (e.g. "Spurs ML / Knicks +4.5") ──
+    {
+      const slashLegs = line.split(/\s+\/\s+/);
+      if (slashLegs.length >= 2) {
+        const legPicks: ParsedPick[] = [];
+        for (const leg of slashLegs) {
+          const p = parsePickLine(leg.trim(), currentCapper, currentSport, tierUnits);
+          if (p) legPicks.push({ ...p, isParlay: true });
+        }
+        if (legPicks.length >= 2) { picks.push(...legPicks); continue; }
+      }
     }
 
     const pick = parsePickLine(line, currentCapper, currentSport, tierUnits);
